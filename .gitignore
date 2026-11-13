@@ -1,0 +1,12 @@
+todo.txt
+
+/target
+
+**/*.rs.bk
+
+.idea/
+.vscode/
+
+.DS_Store
+
+result

@@ -1,0 +1,33 @@
+[package]
+name = "wl-annotate"
+version = "0.1.0"
+edition = "2021"
+description = "Draw annotations directly on the screen on Wayland (layer-shell overlay + screencopy freeze)"
+license = "MIT"
+repository = "https://github.com/EnricoDev1/wl-annotate"
+readme = "README.md"
+keywords = ["wayland", "annotation", "layer-shell", "screencopy", "screen"]
+categories = ["command-line-utilities", "graphics"]
+
+[[bin]]
+name = "wl-annotate"
+path = "src/main.rs"
+
+[[bin]]
+name = "wl-annotatectl"
+path = "src/bin/wl-annotatectl.rs"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+tiny-skia = { version = "0.11", features = ["png-format"] }
+nix = { version = "0.30", features = ["fs", "mman"] }
+signal-hook = { version = "0.3", features = ["iterator"] }
+
+[dev-dependencies]
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+
+[profile.release]
+opt-level = 2

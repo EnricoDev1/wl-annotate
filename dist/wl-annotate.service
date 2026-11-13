@@ -1,0 +1,19 @@
+[Unit]
+Description=wl-annotate screen annotation daemon
+Documentation=https://github.com/EnricoDev1/wl-annotate
+# Tied to the graphical session: starts when it starts, stops when it ends.
+Requires=graphical-session.target
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/wl-annotate
+# the daemon exits cleanly on SIGTERM and on Wayland disconnects, so
+# Restart=always is needed to recover from those too (systemctl stop still
+# wins, and the unit is stopped with the graphical session via PartOf).
+Restart=always
+RestartSec=1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=graphical-session.target
