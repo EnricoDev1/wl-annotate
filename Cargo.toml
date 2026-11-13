@@ -2,11 +2,11 @@
 name = "wl-annotate"
 version = "0.1.0"
 edition = "2021"
-description = "Draw annotations directly on the screen on Wayland (layer-shell overlay + screencopy freeze)"
+description = "Draw annotations directly on the screen on Wayland"
 license = "MIT"
 repository = "https://github.com/EnricoDev1/wl-annotate"
 readme = "README.md"
-keywords = ["wayland", "annotation", "layer-shell", "screencopy", "screen"]
+keywords = ["wayland", "annotation", "layer-shell"]
 categories = ["command-line-utilities", "graphics"]
 
 [[bin]]
