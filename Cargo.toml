@@ -1,6 +1,6 @@
 [package]
 name = "wl-annotate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Draw annotations directly on the screen on Wayland"
 license = "MIT"
@@ -23,7 +23,7 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 tiny-skia = { version = "0.11", features = ["png-format"] }
-nix = { version = "0.30", features = ["fs", "mman"] }
+nix = { version = "0.30", features = ["fs", "mman", "net", "signal"] }
 signal-hook = { version = "0.3", features = ["iterator"] }
 
 [dev-dependencies]

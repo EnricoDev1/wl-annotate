@@ -52,6 +52,8 @@ CONTROL (while running):
 
 IN-SESSION KEYS (while drawing):
     q (or Esc)            stop drawing (restores the screen)
+    u                     undo the last stroke (drag); also undoes a clear
+    shift+u               redo what was undone
     c                     clear annotations
     s                     save PNG snapshot(s)
     r b g m w             pen color: red, blue, green, magenta, white

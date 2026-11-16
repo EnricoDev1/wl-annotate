@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::ptr::NonNull;
@@ -87,32 +87,168 @@ const KEY_G_EVDEV: u32 = 34;
 const KEY_B_EVDEV: u32 = 48;
 const KEY_M_EVDEV: u32 = 50;
 const KEY_W_EVDEV: u32 = 17;
+const KEY_U_EVDEV: u32 = 22;
 
-/// wl_keyboard key events normally carry the evdev code + 8, but some
-/// compositors (notably niri) forward the raw evdev code. Accept both.
-fn key_is(event_code: u32, evdev_code: u32) -> bool {
-    event_code == evdev_code || event_code == evdev_code + 8
+/// xkb modifier bit for Shift (wl_keyboard.modifiers, mods_depressed).
+const MOD_SHIFT: u32 = 0x1;
+
+/// Pen color selected by a letter key while drawing.
+const RED: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
+const GREEN: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
+const BLUE: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
+const MAGENTA: [u8; 4] = [0xff, 0x00, 0xff, 0xff];
+const WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+/// An in-session action bound to a physical key (evdev code).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeyAction {
+    Quit,
+    Clear,
+    Save,
+    Undo, // u: undo, or redo when Shift is held
+    Color(&'static str, [u8; 4]),
 }
 
-/// Pen color selected by a number/letter key while drawing.
-fn color_key(event_code: u32) -> Option<(&'static str, [u8; 4])> {
-    const RED: [u8; 4] = [0xff, 0x00, 0x00, 0xff];
-    const GREEN: [u8; 4] = [0x00, 0xff, 0x00, 0xff];
-    const BLUE: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
-    const MAGENTA: [u8; 4] = [0xff, 0x00, 0xff, 0xff];
-    const WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
-    if key_is(event_code, KEY_R_EVDEV) {
-        Some(("red", RED))
-    } else if key_is(event_code, KEY_G_EVDEV) {
-        Some(("green", GREEN))
-    } else if key_is(event_code, KEY_B_EVDEV) {
-        Some(("blue", BLUE))
-    } else if key_is(event_code, KEY_M_EVDEV) {
-        Some(("magenta", MAGENTA))
-    } else if key_is(event_code, KEY_W_EVDEV) {
-        Some(("white", WHITE))
-    } else {
-        None
+/// Which keycode convention the compositor delivers in wl_keyboard.key
+/// events. Most compositors send the evdev code + 8 (the xkb convention);
+/// niri (Smithay) delivers the raw evdev code. Calibrated at runtime:
+/// the first unambiguous key press settles it, ambiguous presses
+/// ("is this code a raw key, or a +8 key I might receive?") are held
+/// in a tentative state and never fired, so a compositor of either kind
+/// can at worst require re-pressing the first action key - never suffer
+/// a phantom action or a dead "q".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyEncoding {
+    /// No evidence yet.
+    Unknown,
+    /// One ambiguous, +8-looking key was seen. xkb compositors confirm on the
+    /// next such key; a raw-looking key proves the encoding is raw instead.
+    XkbTentative,
+    /// Encoding settled: raw evdev codes. `xkb_hits` counts consecutive
+    /// +8-looking keys seen while settled, to recover a wrong calibration.
+    RawEvdev { xkb_hits: u8 },
+    /// Encoding settled: evdev + 8 (xkb convention). Symmetric counter.
+    XkbPlus8 { raw_hits: u8 },
+}
+
+fn action_for_evdev(code: u32) -> Option<KeyAction> {
+    use KeyAction::*;
+    match code {
+        KEY_Q_EVDEV | KEY_ESC_EVDEV => Some(Quit),
+        KEY_C_EVDEV => Some(Clear),
+        KEY_S_EVDEV => Some(Save),
+        KEY_U_EVDEV => Some(Undo),
+        KEY_R_EVDEV => Some(Color("red", RED)),
+        KEY_G_EVDEV => Some(Color("green", GREEN)),
+        KEY_B_EVDEV => Some(Color("blue", BLUE)),
+        KEY_M_EVDEV => Some(Color("magenta", MAGENTA)),
+        KEY_W_EVDEV => Some(Color("white", WHITE)),
+        _ => None,
+    }
+}
+
+/// Modifier keys that are benign on a raw compositor but whose xkb reading
+/// (42 -> green, 54 -> clear, 56 -> blue) is bound: they are pressed all the
+/// time (shift = the redo modifier) without meaning any action, so they must
+/// not be used as encoding evidence.
+const BENIGN_MODIFIER_CODES: [u32; 3] = [42, 54, 56];
+
+fn is_benign_modifier(code: u32) -> bool {
+    BENIGN_MODIFIER_CODES.contains(&code)
+}
+
+/// Resolve a delivered keycode to an action, calibrating `enc` along the
+/// way. Design constraints:
+/// - a settled encoding must never fire the *other* convention's phantom
+///   (niri user typing 'a' = raw 30 must not undo = u+8);
+/// - a wrong calibration must never block the user: a raw-looking key while
+///   tentative (or twice in a row while settled the other way) heals it and
+///   fires;
+/// - an ambiguous key never fires while unsettled, so the worst outcome is
+///   re-pressing the first action key after daemon start.
+///
+/// Special case: delivered code KEY_M (50) is raw 'm' on niri but what an
+/// xkb compositor sends for LeftShift (42+8). Shift is common (shift+u =
+/// redo), so it is treated as ambiguous, not as unambiguous raw evidence.
+fn resolve_action(enc: &mut KeyEncoding, code: u32) -> Option<KeyAction> {
+    let raw = action_for_evdev(code);
+    let xkb = code.checked_sub(8).and_then(action_for_evdev);
+    match (*enc, raw, xkb) {
+        // Settled: raw evdev codes (niri).
+        (KeyEncoding::RawEvdev { xkb_hits }, Some(a), _) => {
+            if xkb_hits != 0 {
+                *enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+            }
+            Some(a)
+        }
+        (KeyEncoding::RawEvdev { xkb_hits }, None, Some(a)) => {
+            // +8-looking key on a raw compositor: phantom of the other
+            // convention. Benign modifier presses never count; two real
+            // action-collisions in a row mean the calibration is wrong.
+            if is_benign_modifier(code) {
+                return None;
+            }
+            if xkb_hits >= 1 {
+                *enc = KeyEncoding::XkbPlus8 { raw_hits: 0 };
+                log(true, format_args!("keycode encoding corrected: evdev+8 (xkb)"));
+                Some(a)
+            } else {
+                *enc = KeyEncoding::RawEvdev { xkb_hits: 1 };
+                None
+            }
+        }
+        (KeyEncoding::RawEvdev { .. }, None, None) => None,
+        // Settled: evdev + 8.
+        (KeyEncoding::XkbPlus8 { raw_hits }, _, Some(a)) => {
+            if raw_hits != 0 {
+                *enc = KeyEncoding::XkbPlus8 { raw_hits: 0 };
+            }
+            Some(a)
+        }
+        (KeyEncoding::XkbPlus8 { raw_hits }, Some(a), None) => {
+            // Raw-looking key on an xkb compositor: mirror of the above.
+            if raw_hits >= 1 {
+                *enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+                log(true, format_args!("keycode encoding corrected: raw evdev"));
+                Some(a)
+            } else {
+                *enc = KeyEncoding::XkbPlus8 { raw_hits: 1 };
+                None
+            }
+        }
+        (KeyEncoding::XkbPlus8 { .. }, None, None) => None,
+        // Tentative after one ambiguous key.
+        (KeyEncoding::XkbTentative, None, Some(a)) => {
+            if is_benign_modifier(code) {
+                return None; // shifts are not evidence of an xkb compositor
+            }
+            *enc = KeyEncoding::XkbPlus8 { raw_hits: 0 };
+            log(true, format_args!("keycode encoding calibrated: evdev+8 (xkb)"));
+            Some(a)
+        }
+        (KeyEncoding::XkbTentative, Some(a), _) => {
+            *enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+            log(true, format_args!("keycode encoding calibrated: raw evdev"));
+            Some(a)
+        }
+        (KeyEncoding::XkbTentative, None, None) => None,
+        // Unsettled.
+        (KeyEncoding::Unknown, Some(a), None) if code != KEY_M_EVDEV => {
+            *enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+            log(true, format_args!("keycode encoding calibrated: raw evdev"));
+            Some(a)
+        }
+        // KEY_M delivered while unsettled: raw 'm' (niri) vs LeftShift +8
+        // (xkb compositors, common for redo). Hold as tentative, no fire.
+        (KeyEncoding::Unknown, Some(_), _) => {
+            *enc = KeyEncoding::XkbTentative;
+            None
+        }
+        (KeyEncoding::Unknown, None, Some(_)) => {
+            *enc = KeyEncoding::XkbTentative;
+            None
+        }
+        (KeyEncoding::Unknown, None, None) => None,
     }
 }
 
@@ -244,6 +380,14 @@ pub struct State {
     pub active: bool,
     pub quit: bool,
     pub pointer_session: Option<usize>,
+    /// Output whose layer surface currently has keyboard focus
+    /// (target of the undo key).
+    pub keyboard_session: Option<usize>,
+    /// Depressed keyboard modifiers (xkb bitmask) from wl_keyboard.
+    pub mods: u32,
+    /// Which keycode convention this compositor delivers; calibrated from
+    /// the first unambiguous session key press.
+    pub key_encoding: KeyEncoding,
     pub pointer_pos: Option<(f32, f32)>,
     pub pen: f32,
 }
@@ -275,6 +419,9 @@ impl State {
             active: false,
             quit: false,
             pointer_session: None,
+            keyboard_session: None,
+            mods: 0,
+            key_encoding: KeyEncoding::Unknown,
             pointer_pos: None,
             pen,
         }
@@ -369,6 +516,7 @@ impl State {
         }
         self.active = false;
         self.pointer_session = None;
+        self.keyboard_session = None;
         self.pointer_pos = None;
         if let Some(cursor) = self.cursor.take() {
             cursor.surface.destroy();
@@ -487,6 +635,7 @@ impl State {
                 self.redraw(i, rect);
             }
         }
+        log(true, format_args!("cleared"));
     }
 
     fn save_all(&mut self) -> String {
@@ -652,6 +801,7 @@ impl State {
     fn remove_session(&mut self, output_name: u32) {
         self.sessions.retain(|s| s.output_name != output_name);
         self.pointer_session = None;
+        self.keyboard_session = None;
     }
 
     /// Flush a changed region of the canvas to the SHM buffer and commit it.
@@ -701,6 +851,8 @@ impl State {
                     let Some(s) = self.sessions.get_mut(idx) else { return };
                     s.drawing = true;
                     let Some(canvas) = s.canvas.as_mut() else { return };
+                    // one drag (press -> release) is one undo step
+                    canvas.begin_step();
                     let (lw, lh) = (s.logical.0.max(1) as f32, s.logical.1.max(1) as f32);
                     let bx = x / lw * canvas.width as f32;
                     let by = y / lh * canvas.height as f32;
@@ -715,6 +867,9 @@ impl State {
             (BTN_LEFT, false) => {
                 if let Some(s) = self.sessions.get_mut(idx) {
                     s.drawing = false;
+                    if let Some(canvas) = s.canvas.as_mut() {
+                        canvas.end_step(); // commit the drag to the undo history
+                    }
                 }
             }
             (BTN_RIGHT, true) => {
@@ -827,14 +982,81 @@ pub fn setup_socket(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Outcome of a probe against the control socket path.
+enum Probe {
+    /// A listener accepted (or queued) us: an instance is alive.
+    Connected(UnixStream),
+    /// No listener: stale socket file or the previous daemon exited.
+    Refused,
+    /// Listener exists but refuses to queue us right now (hung + full
+    /// backlog): treat as alive.
+    Busy,
+}
+
+/// Connect without ever sleeping in the kernel: a blocking client socket can
+/// hang forever in unix_wait_for_peer() against a hung foreign listener that
+/// never accept()s, and the takeover must be deadlock-free.
+fn probe_socket(path: &Path) -> Probe {
+    let Ok(addr) = nix::sys::socket::UnixAddr::new(path) else {
+        return Probe::Refused;
+    };
+    let Ok(fd) = nix::sys::socket::socket(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Stream,
+        nix::sys::socket::SockFlag::SOCK_NONBLOCK,
+        None,
+    ) else {
+        return Probe::Busy;
+    };
+    match nix::sys::socket::connect(fd.as_raw_fd(), &addr) {
+        Ok(()) => {
+            let stream = unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) };            // back to blocking for the polite-quit conversation
+            let _ = stream.set_nonblocking(false);
+            Probe::Connected(stream)
+        }
+        Err(nix::errno::Errno::ECONNREFUSED)
+        | Err(nix::errno::Errno::ENOENT)
+        | Err(nix::errno::Errno::ECONNRESET)
+        | Err(nix::errno::Errno::EPIPE) => Probe::Refused,
+        Err(_) => Probe::Busy,
+    }
+}
+
+fn wait_socket_free(path: &Path) -> bool {
+    for _ in 0..200 {
+        if matches!(probe_socket(path), Probe::Refused) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
 /// Single-instance semantics: if a previous daemon holds the control socket,
 /// ask it to quit and wait for it to release takeover of the screen (two
 /// live overlays would fight for keyboard focus on some compositors).
+///
+/// If the previous daemon is hung and ignores the polite quit, identify the
+/// holding PID via SO_PEERCRED and SIGKILL it (guarded by a /proc cmdline
+/// check so a recycled PID is never killed).
 pub fn take_over_socket(path: &Path) {
     if !path.exists() {
         return;
     }
-    let Ok(mut stream) = UnixStream::connect(path) else { return };
+    let mut stream = match probe_socket(path) {
+        Probe::Refused => return, // stale socket file, no listener
+        Probe::Busy => {
+            // could not even queue us; it may be exiting, give it a moment
+            if wait_socket_free(path) {
+                return;
+            }
+            eprintln!("wl-annotate: previous instance is busy, forcing takeover");
+            kill_stale_holder(path);
+            let _ = wait_socket_free(path);
+            return;
+        }
+        Probe::Connected(stream) => stream,
+    };
     set_rcvtimeo(&stream, 2);
     eprintln!("wl-annotate: a previous instance is running, asking it to quit");
     if stream.write_all(b"quit\n").is_ok() {
@@ -842,13 +1064,69 @@ pub fn take_over_socket(path: &Path) {
         let mut reply = String::new();
         let _ = stream.read_to_string(&mut reply); // old daemon closes on exit
     }
-    // Give the old daemon a moment to fully unmap, then fall through:
-    // setup_socket() removes the stale path anyway.
-    for _ in 0..200 {
-        if UnixStream::connect(path).is_err() {
-            break;
+    // The old daemon closes the socket on exit. Polling also reconnects to
+    // it: the pending connection is the event that lets a busy event loop
+    // observe Command::Quit and exit.
+    if wait_socket_free(path) {
+        return; // previous instance exited cleanly
+    }
+    // Still listening after 2s: the previous daemon is hung.
+    eprintln!("wl-annotate: previous instance is not responding, forcing takeover");
+    kill_stale_holder(path);
+    let _ = wait_socket_free(path);
+}
+
+/// SIGKILL the process holding a hung control socket, after verifying via
+/// /proc that the PID still belongs to us (guards against PID reuse).
+/// SIGKILL the process holding a hung control socket. Guarded: only a
+/// process whose argv[0] basename is `wl-annotate` is ever killed —
+/// never a recycled PID or a foreign process that happens to mention the
+/// socket path in its arguments.
+fn kill_stale_holder(path: &Path) {
+    let stream = match probe_socket(path) {
+        Probe::Connected(stream) => stream,
+        _ => {
+            eprintln!(
+                "wl-annotate: socket {} is still occupied but the holder is not identifiable; leaving it alone",
+                path.display()
+            );
+            return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let Ok(cred) =
+        nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+    else {
+        return;
+    };
+    let pid = cred.pid();
+    if pid <= 0 {
+        return;
+    }
+    if !holder_is_wl_annotate(pid) {
+        eprintln!(
+            "wl-annotate: socket {} is held by pid {pid}, which is not wl-annotate; leaving it alone",
+            path.display()
+        );
+        return;
+    }
+    eprintln!("wl-annotate: killing hung instance pid {pid}");
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::SIGKILL,
+    );
+}
+
+/// True if /proc/`pid` was started as a `wl-annotate` binary (argv[0]
+/// basename check: robust against PID reuse and against processes that
+/// merely mention the socket path in their arguments).
+fn holder_is_wl_annotate(pid: i32) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    match std::str::from_utf8(argv0).ok().map(Path::new) {
+        Some(p) => p.file_name().and_then(|s| s.to_str()) == Some("wl-annotate"),
+        None => false,
     }
 }
 
@@ -1025,40 +1303,73 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
         _: &QueueHandle<State>,
     ) {
         match event {
-            wl_keyboard::Event::Enter { keys, .. } => {
+            wl_keyboard::Event::Enter { keys, surface, .. } => {
+                let idx = state
+                    .sessions
+                    .iter()
+                    .position(|s| s.wl_surface.as_ref() == Some(&surface));
+                if let Some(i) = idx {
+                    state.keyboard_session = Some(i);
+                }
                 log(true, format_args!("keyboard enter (focused): {keys:?}"));
             }
             wl_keyboard::Event::Leave { .. } => {
+                state.keyboard_session = None;
+                state.mods = 0;
                 log(true, format_args!("keyboard leave (unfocused)"));
             }
             wl_keyboard::Event::Key { key, state: ks, .. } => {
                 log(true, format_args!("key event: code {key}, state {ks:?}"));
-                if (key_is(key, KEY_Q_EVDEV) || key_is(key, KEY_ESC_EVDEV))
-                    && matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed))
-                {
-                    log(true, format_args!("stop drawing (q/Esc)"));
-                    state.deactivate();
-                    if state.config.once {
-                        state.quit = true;
+                if !matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
+                    return;
+                }
+                let action = resolve_action(&mut state.key_encoding, key);
+                let Some(action) = action else { return };
+                match action {
+                    KeyAction::Quit => {
+                        log(true, format_args!("stop drawing (q/Esc)"));
+                        state.deactivate();
+                        if state.config.once {
+                            state.quit = true;
+                        }
                     }
-                } else if key_is(key, KEY_C_EVDEV)
-                    && matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed))
-                {
-                    state.clear_all();
-                } else if key_is(key, KEY_S_EVDEV)
-                    && matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed))
-                {
-                    let r = state.save_all();
-                    log(true, format_args!("{r}"));
-                } else if let Some((name, color)) = color_key(key) {
-                    if matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed)) {
+                    KeyAction::Clear => state.clear_all(),
+                    KeyAction::Save => {
+                        let r = state.save_all();
+                        log(true, format_args!("{r}"));
+                    }
+                    KeyAction::Color(name, color) => {
                         state.config.color = color;
                         log(true, format_args!("pen color: {name}"));
+                    }
+                    KeyAction::Undo => {
+                        let target = state.keyboard_session.or(state.pointer_session);
+                        let undo = state.mods & MOD_SHIFT == 0;
+                        let dirty = target.and_then(|i| {
+                            let canvas = state.sessions.get_mut(i)?.canvas.as_mut()?;
+                            if undo {
+                                canvas.undo()
+                            } else {
+                                canvas.redo()
+                            }
+                        });
+                        let what = if undo { "undo" } else { "redo" };
+                        match (target, dirty) {
+                            (Some(i), Some(rect)) => {
+                                state.redraw(i, rect);
+                                log(true, format_args!("{what}"));
+                            }
+                            (_, None) => log(true, format_args!("nothing to {what}")),
+                            (None, Some(_)) => {}
+                        }
                     }
                 }
             }
             // We compare raw evdev keycodes, so the keymap fd is not needed.
             wl_keyboard::Event::Keymap { .. } => {}
+            wl_keyboard::Event::Modifiers { mods_depressed, .. } => {
+                state.mods = mods_depressed;
+            }
             _ => {}
         }
     }
@@ -1190,3 +1501,121 @@ wayland_client::delegate_noop!(State: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(State: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(State: ignore wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::ZwlrLayerShellV1);
 wayland_client::delegate_noop!(State: ignore ZwlrScreencopyManagerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_comp_first_action_key_fires_immediately() {
+        let mut enc = KeyEncoding::Unknown;
+        // q = raw 16 (niri), unambiguous: calibrate raw and fire now.
+        assert_eq!(resolve_action(&mut enc, KEY_Q_EVDEV), Some(KeyAction::Quit));
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 });
+    }
+
+    #[test]
+    fn xkb_comp_needs_two_presses_then_confirms() {
+        let mut enc = KeyEncoding::Unknown;
+        // On an xkb compositor, 'u' is delivered as evdev+8 = 30, which raw-reads
+        // as 'a': ambiguous. First press must be silent, not a phantom undo.
+        assert_eq!(resolve_action(&mut enc, KEY_U_EVDEV + 8), None);
+        assert_eq!(enc, KeyEncoding::XkbTentative);
+        // The next xkb-looking key confirms xkb and fires.
+        assert_eq!(resolve_action(&mut enc, KEY_U_EVDEV + 8), Some(KeyAction::Undo));
+        assert_eq!(enc, KeyEncoding::XkbPlus8 { raw_hits: 0 });
+    }
+
+    #[test]
+    fn ambiguous_key_then_raw_key_heals() {
+        let mut enc = KeyEncoding::Unknown;
+        // niri user presses 'a' (30): xkb-looking, silent tentative.
+        assert_eq!(resolve_action(&mut enc, 30), None);
+        assert_eq!(enc, KeyEncoding::XkbTentative);
+        // Then presses q (16): raw-looking; heals to raw and fires. This is
+        // the flow that must never leave the user stuck.
+        assert_eq!(resolve_action(&mut enc, KEY_Q_EVDEV), Some(KeyAction::Quit));
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 });
+    }
+
+    #[test]
+    fn raw_comp_phantoms_are_rejected() {
+        let mut enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+        // 'a' = raw 30 = u+8: phantom undo must be rejected on niri.
+        assert_eq!(resolve_action(&mut enc, 30), None);
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 1 });
+        // Another +8-looking key would heal a wrong raw calibration; the
+        // single hit above must not be reset by it. Now heal with u+8.
+        assert_eq!(resolve_action(&mut enc, KEY_U_EVDEV + 8), Some(KeyAction::Undo));
+        assert_eq!(enc, KeyEncoding::XkbPlus8 { raw_hits: 0 });
+    }
+
+    #[test]
+    fn xkb_comp_phantoms_are_rejected() {
+        let mut enc = KeyEncoding::XkbPlus8 { raw_hits: 0 };
+        // KEY_C raw-delivered reads as 'l' on an xkb compositor; the raw
+        // Clear hypothesis must be rejected.
+        assert_eq!(resolve_action(&mut enc, KEY_C_EVDEV), None);
+        assert_eq!(enc, KeyEncoding::XkbPlus8 { raw_hits: 1 });
+        // Second raw-looking key flips to raw and fires (mash to recover).
+        assert_eq!(resolve_action(&mut enc, KEY_Q_EVDEV), Some(KeyAction::Quit));
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 });
+    }
+
+    #[test]
+    fn m_key_is_ambiguous_while_unsettled() {
+        // Delivered 50 = raw 'm' (niri) vs LeftShift on xkb compositors
+        // (42+8). Shift is the redo modifier, so a first press must not
+        // flash magenta and mis-calibrate.
+        let mut enc = KeyEncoding::Unknown;
+        assert_eq!(resolve_action(&mut enc, KEY_M_EVDEV), None);
+        assert_eq!(enc, KeyEncoding::XkbTentative);
+        // Repeating 'm' resolves it as raw magenta.
+        let fired = resolve_action(&mut enc, KEY_M_EVDEV);
+        assert!(matches!(fired, Some(KeyAction::Color("magenta", _))));
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 });
+    }
+
+    #[test]
+    fn actions_fire_after_raw_calibration() {
+        let mut enc = KeyEncoding::Unknown;
+        let color = resolve_action(&mut enc, KEY_G_EVDEV);
+        assert!(matches!(color, Some(KeyAction::Color("green", _))));
+        assert_eq!(resolve_action(&mut enc, KEY_C_EVDEV), Some(KeyAction::Clear));
+        assert_eq!(resolve_action(&mut enc, KEY_U_EVDEV), Some(KeyAction::Undo));
+    }
+
+    #[test]
+    fn shift_presses_are_not_encoding_evidence() {
+        // Shift is the redo modifier and is pressed all the time with no
+        // action intent. It must neither confirm a tentative xkb encoding
+        // nor accumulate collision hits that could let an unrelated 'a'
+        // flip the calibration on niri.
+        let mut enc = KeyEncoding::Unknown;
+        assert_eq!(resolve_action(&mut enc, 30), None); // 'a': tentative
+        assert_eq!(
+            resolve_action(&mut enc, 42), // LeftShift
+            None
+        );
+        assert_eq!(enc, KeyEncoding::XkbTentative, "shift must not confirm tentative");
+        assert_eq!(
+            resolve_action(&mut enc, 30), // 'a' again: confirm is fine here
+            Some(KeyAction::Undo)
+        );
+
+        let mut enc = KeyEncoding::RawEvdev { xkb_hits: 0 };
+        assert_eq!(resolve_action(&mut enc, 42), None); // LeftShift
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 }, "no hit from shift");
+        assert_eq!(resolve_action(&mut enc, 54), None); // RightShift
+        assert_eq!(resolve_action(&mut enc, 56), None); // LeftAlt
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 0 });
+        // A benign modifier in between must not reset or double the counter:
+        // one real collision stays pending, and the second real collision
+        // heals. Shift alone never advances it.
+        assert_eq!(resolve_action(&mut enc, 30), None); // 'a': hit 1
+        assert_eq!(resolve_action(&mut enc, 42), None); // shift in between
+        assert_eq!(enc, KeyEncoding::RawEvdev { xkb_hits: 1 });
+        assert_eq!(resolve_action(&mut enc, 30), Some(KeyAction::Undo)); // 'a': heal
+        assert_eq!(enc, KeyEncoding::XkbPlus8 { raw_hits: 0 });
+    }
+}

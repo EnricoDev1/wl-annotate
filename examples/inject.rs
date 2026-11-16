@@ -1,7 +1,10 @@
 //! Dev tool: inject a key through zwp_virtual_keyboard_v1 (dev-dependency only).
 //!
-//! Usage: cargo run --release --example inject [keycode] [hold_ms]
-//! Defaults: injects raw KEY_Q (16), holds 80ms.
+//! Usage: cargo run --release --example inject [keycode] [hold_ms] [mode]
+//! Defaults: injects raw KEY_Q (16), holds 80ms, mode "tap".
+//! Modes: tap = press+release, down = press only, up = release only.
+//! down/up allow holding a modifier across a separate key injection
+//! (e.g. shift+u: inject 42 0 down && inject 22 && inject 42 0 up).
 //!
 //! The keycode is sent as given, unchanged. Compositors differ in what they
 //! forward to the focused client: niri 26.04 delivers raw evdev codes, while
@@ -64,6 +67,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for St {
 
 fn main() {    let send_code: u32 = std::env::args().nth(1).map(|a| a.parse().expect("code")).unwrap_or(16);
     let hold_ms: u64 = std::env::args().nth(2).map(|a| a.parse().expect("ms")).unwrap_or(80);
+    let mode = std::env::args().nth(3).unwrap_or_else(|| "tap".to_string());
+    let press = mode != "up";
+    let release = mode != "down";
 
     let conn = Connection::connect_to_env().expect("connect");
     let mut queue = conn.new_event_queue::<St>();
@@ -102,14 +108,18 @@ fn main() {    let send_code: u32 = std::env::args().nth(1).map(|a| a.parse().ex
 
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    eprintln!("injecting key: code={send_code}");
-    vk.key(0, send_code, 1); // pressed
-    conn.flush().expect("flush press");
-    queue.roundtrip(&mut st).expect("roundtrip press");
-    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
-    vk.key(hold_ms as u32, send_code, 0); // released
-    conn.flush().expect("flush release");
-    queue.roundtrip(&mut st).expect("roundtrip release");
+    eprintln!("injecting key: code={send_code}, mode={mode}");
+    if press {
+        vk.key(0, send_code, 1); // pressed
+        conn.flush().expect("flush press");
+        queue.roundtrip(&mut st).expect("roundtrip press");
+        std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+    }
+    if release {
+        vk.key(hold_ms as u32, send_code, 0); // released
+        conn.flush().expect("flush release");
+        queue.roundtrip(&mut st).expect("roundtrip release");
+    }
     eprintln!("done");
 }
 

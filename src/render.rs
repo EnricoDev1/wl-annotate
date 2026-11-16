@@ -79,6 +79,25 @@ pub struct DirtyRect {
     pub h: u32,
 }
 
+/// One recorded pen segment, buffer pixel coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct Seg {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub pen: f32,
+    pub color: [u8; 4],
+}
+
+/// One undoable action.
+pub enum Action {
+    /// All segments of one drag (button press -> release).
+    Draw(Vec<Seg>),
+    /// A full clear; undoing it restores everything drawn before it.
+    Clear,
+}
+
 /// A drawing surface: the frozen background with strokes painted directly on
 /// top. Segments are rendered into a small scratch pixmap bounded to the
 /// stroke's bounding box and blitted back, so a pointer motion only touches a
@@ -88,6 +107,51 @@ pub struct Canvas {
     pub height: u32,
     bg: Pixmap,
     frame: Pixmap,
+    history: Vec<Action>,
+    /// Actions removed by undo, restored by redo.
+    redo_stack: Vec<Action>,
+    /// Segments of the drag in progress (since button press).
+    current: Option<Vec<Seg>>,
+}
+
+/// Paint one segment into `frame` (buffer pixels), clipped to the canvas.
+fn paint_seg(frame: &mut Pixmap, seg: &Seg, width: u32, height: u32) -> Option<DirtyRect> {
+    let margin = seg.pen.max(0.5) / 2.0 + 3.0;
+    let min_x = (seg.x0.min(seg.x1) - margin).floor().max(0.0) as i32;
+    let min_y = (seg.y0.min(seg.y1) - margin).floor().max(0.0) as i32;
+    let max_x = (seg.x0.max(seg.x1) + margin).ceil().min(width as f32) as i32;
+    let max_y = (seg.y0.max(seg.y1) + margin).ceil().min(height as f32) as i32;
+    let (bw, bh) = (max_x - min_x, max_y - min_y);
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+    let mut scratch = Pixmap::new(bw as u32, bh as u32)?;
+    let mut pb = PathBuilder::new();
+    pb.move_to(seg.x0 - min_x as f32, seg.y0 - min_y as f32);
+    pb.line_to(seg.x1 - min_x as f32, seg.y1 - min_y as f32);
+    let path = pb.finish()?;
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(seg.color[0], seg.color[1], seg.color[2], seg.color[3]);
+    paint.anti_alias = true;
+    let stroke = Stroke {
+        width: seg.pen.max(0.5),
+        miter_limit: 4.0,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        dash: None,
+    };
+    scratch
+        .as_mut()
+        .stroke_path(&path, &paint, &stroke, Transform::default(), None);
+    frame.as_mut().draw_pixmap(
+        min_x,
+        min_y,
+        scratch.as_ref(),
+        &PixmapPaint::default(),
+        Transform::default(),
+        None,
+    );
+    Some(DirtyRect { x: min_x, y: min_y, w: bw as u32, h: bh as u32 })
 }
 
 impl Canvas {
@@ -107,7 +171,32 @@ impl Canvas {
             None,
         );
         let bg = frame.clone();
-        Some(Canvas { width, height, bg, frame })
+        Some(Canvas {
+            width,
+            height,
+            bg,
+            frame,
+            history: Vec::new(),
+            redo_stack: Vec::new(),
+            current: None,
+        })
+    }
+
+    /// Start a new undo step (called on button press). Any new action
+    /// invalidates the redo history.
+    pub fn begin_step(&mut self) {
+        self.end_step(); // commit a dangling step if any
+        self.redo_stack.clear();
+        self.current = Some(Vec::new());
+    }
+
+    /// Commit the drag in progress to the undo history (button release).
+    pub fn end_step(&mut self) {
+        if let Some(step) = self.current.take() {
+            if !step.is_empty() {
+                self.history.push(Action::Draw(step));
+            }
+        }
     }
 
     /// Draw one pen segment (buffer pixel coordinates) and return the region
@@ -121,49 +210,63 @@ impl Canvas {
         pen: f32,
         color: [u8; 4],
     ) -> Option<DirtyRect> {
-        let margin = pen.max(0.5) / 2.0 + 3.0;
-        let min_x = (x0.min(x1) - margin).floor().max(0.0) as i32;
-        let min_y = (y0.min(y1) - margin).floor().max(0.0) as i32;
-        let max_x = (x0.max(x1) + margin).ceil().min(self.width as f32) as i32;
-        let max_y = (y0.max(y1) + margin).ceil().min(self.height as f32) as i32;
-        let (bw, bh) = (max_x - min_x, max_y - min_y);
-        if bw <= 0 || bh <= 0 {
-            return None;
+        let seg = Seg { x0, y0, x1, y1, pen, color };
+        if let Some(step) = self.current.as_mut() {
+            step.push(seg);
         }
-        let mut scratch = Pixmap::new(bw as u32, bh as u32)?;
-        let mut pb = PathBuilder::new();
-        pb.move_to(x0 - min_x as f32, y0 - min_y as f32);
-        pb.line_to(x1 - min_x as f32, y1 - min_y as f32);
-        let path = pb.finish()?;
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-        paint.anti_alias = true;
-        let stroke = Stroke {
-            width: pen.max(0.5),
-            miter_limit: 4.0,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            dash: None,
-        };
-        scratch
-            .as_mut()
-            .stroke_path(&path, &paint, &stroke, Transform::default(), None);
-        self.frame.as_mut().draw_pixmap(
-            min_x,
-            min_y,
-            scratch.as_ref(),
-            &PixmapPaint::default(),
-            Transform::default(),
-            None,
-        );
-        Some(DirtyRect { x: min_x, y: min_y, w: bw as u32, h: bh as u32 })
+        paint_seg(&mut self.frame, &seg, self.width, self.height)
     }
 
     /// Erase all strokes, restoring the frozen background. Returns the region
-    /// of the canvas that changed (the whole canvas).
+    /// of the canvas that changed (the whole canvas). Recorded in the undo
+    /// history: undo right after restores everything. A new clear invalidates
+    /// the redo history.
     pub fn clear(&mut self) -> DirtyRect {
+        self.end_step();
+        self.redo_stack.clear();
+        self.history.push(Action::Clear);
         self.frame = self.bg.clone();
         DirtyRect { x: 0, y: 0, w: self.width, h: self.height }
+    }
+
+    /// Undo the last action (one drag or one clear). Rebuilds the frame by
+    /// replaying the remaining history over the frozen background. Returns
+    /// the damaged region, or None if there is nothing left to undo.
+    /// The undone action is kept for redo().
+    pub fn undo(&mut self) -> Option<DirtyRect> {
+        self.end_step();
+        let popped = self.history.pop()?;
+        self.redo_stack.push(popped);
+        self.rebuild_from_history();
+        Some(DirtyRect { x: 0, y: 0, w: self.width, h: self.height })
+    }
+
+    /// Redo the action most recently undone. Returns the damaged region, or
+    /// None if there is nothing to redo.
+    pub fn redo(&mut self) -> Option<DirtyRect> {
+        self.end_step();
+        let popped = self.redo_stack.pop()?;
+        self.history.push(popped);
+        self.rebuild_from_history();
+        Some(DirtyRect { x: 0, y: 0, w: self.width, h: self.height })
+    }
+
+    /// frame = background + replay of the full history.
+    fn rebuild_from_history(&mut self) {
+        let mut frame = self.bg.clone();
+        for action in &self.history {
+            match action {
+                Action::Draw(segs) => {
+                    for seg in segs {
+                        paint_seg(&mut frame, seg, self.width, self.height);
+                    }
+                }
+                Action::Clear => {
+                    frame = self.bg.clone();
+                }
+            }
+        }
+        self.frame = frame;
     }
 
     /// Write the given region (or the whole frame) as XRGB8888 into a SHM
@@ -334,5 +437,155 @@ mod tests {
         let rect = c.clear();
         assert_eq!(rect, DirtyRect { x: 0, y: 0, w: 2, h: 2 });
         assert_eq!(&c.frame.data()[0..4], &[255, 0, 0, 255]);
+    }
+
+    fn pixel(pm: &Pixmap, x: usize, y: usize, w: usize) -> [u8; 4] {
+        let d = pm.data();
+        let i = (y * w + x) * 4;
+        [d[i], d[i + 1], d[i + 2], d[i + 3]]
+    }
+
+    fn dominated_by(px: [u8; 4], c: [u8; 4]) -> bool {
+        // stroke color dominates the AA-blended pixel
+        let (sr, sg, sb) = (px[0] as i32, px[1] as i32, px[2] as i32);
+        let (cr, cg, cb) = (c[0] as i32, c[1] as i32, c[2] as i32);
+        let dist = (sr - cr).abs() + (sg - cg).abs() + (sb - cb).abs();
+        dist < 160
+    }
+
+    #[test]
+    fn undo_removes_last_drag() {
+        let img = img_argb(64, 64, [0, 0, 255, 255]); // red bg
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        // drag 1: green stroke on the left
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        // drag 2: blue stroke on the right
+        c.begin_step();
+        c.stroke_segment(40.0, 40.0, 40.0, 44.0, 2.0, [0, 0, 255, 255]).unwrap();
+        c.stroke_segment(40.0, 40.0, 40.0, 44.0, 2.0, [0, 0, 255, 255]).unwrap();
+        c.end_step();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]));
+        assert!(dominated_by(pixel(&c.frame, 40, 42, 64), [0, 0, 255, 255]));
+        // undo removes drag 2 only
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]),
+            "drag 1 must survive: {:?}", pixel(&c.frame, 10, 12, 64));
+        assert!(!dominated_by(pixel(&c.frame, 40, 42, 64), [0, 0, 255, 255]),
+            "drag 2 must be gone: {:?}", pixel(&c.frame, 40, 42, 64));
+        // undo removes drag 1
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]));
+        // nothing left to undo
+        assert!(c.undo().is_none());
+    }
+
+    #[test]
+    fn undo_clear_restores() {
+        let img = img_argb(64, 64, [0, 0, 255, 255]); // red bg
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        c.clear();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]),
+            "clear must reset to bg");
+        // undo the clear: the stroke comes back
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]),
+            "undo must restore the stroke: {:?}", pixel(&c.frame, 10, 12, 64));
+    }
+
+    #[test]
+    fn undo_during_drag_commits_it_first() {
+        // pressing undo while a drag is still open commits that drag, then
+        // undoes it right away (net effect: nothing drawn)
+        let img = img_argb(64, 64, [0, 0, 255, 255]);
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        // no end_step(): undo called mid-drag
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]),
+            "mid-drag undo should leave no stroke: {:?}", pixel(&c.frame, 10, 12, 64));
+    }
+
+    #[test]
+    fn click_dot_is_one_step() {
+        // a plain click draws a dot; one undo removes it
+        let img = img_argb(64, 64, [0, 0, 255, 255]);
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(30.0, 30.0, 30.01, 30.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        assert!(dominated_by(pixel(&c.frame, 30, 30, 64), [0, 255, 0, 255]));
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 30, 30, 64), [255, 0, 0, 255]));
+        assert!(c.undo().is_none());
+    }
+
+    #[test]
+    fn redo_restores_undone() {
+        let img = img_argb(64, 64, [0, 0, 255, 255]); // red bg
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        c.undo();
+        assert!(c.undo().is_none());
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]));
+        // redo brings the drag back, pixel-identical
+        c.redo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]));
+        assert!(c.redo().is_none(), "nothing left to redo");
+        // undo/undo/redo redo ordering stays consistent
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]));
+        c.redo();
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn new_draw_invalidates_redo() {
+        let img = img_argb(64, 64, [0, 0, 255, 255]); // red bg
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        // drag 2
+        c.begin_step();
+        c.stroke_segment(40.0, 40.0, 40.0, 44.0, 2.0, [0, 0, 255, 255]).unwrap();
+        c.end_step();
+        // undo both
+        c.undo();
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 40, 42, 64), [255, 0, 0, 255]));
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]));
+        // draw something new: redo history is gone
+        c.begin_step();
+        c.stroke_segment(20.0, 20.0, 20.0, 24.0, 2.0, [255, 255, 0, 255]).unwrap();
+        c.end_step();
+        assert!(c.redo().is_none(), "redo must be invalid after a new draw");
+        assert!(dominated_by(pixel(&c.frame, 20, 22, 64), [255, 255, 0, 255]));
+        // undo still works on the new step
+        c.undo();
+        assert!(dominated_by(pixel(&c.frame, 20, 22, 64), [255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn redo_clear() {
+        let img = img_argb(64, 64, [0, 0, 255, 255]); // red bg
+        let mut c = Canvas::new(&img, 64, 64).unwrap();
+        c.begin_step();
+        c.stroke_segment(10.0, 10.0, 10.0, 14.0, 2.0, [0, 255, 0, 255]).unwrap();
+        c.end_step();
+        c.clear();
+        c.undo(); // undo the clear
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [0, 255, 0, 255]));
+        c.redo(); // redo the clear
+        assert!(dominated_by(pixel(&c.frame, 10, 12, 64), [255, 0, 0, 255]),
+            "redo of a clear must wipe again");
+        assert!(c.redo().is_none());
     }
 }
