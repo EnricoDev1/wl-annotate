@@ -17,6 +17,8 @@ Press a key, the screen freezes, draw with the mouse, press `q` to finish. `wl-a
 cargo install wl-annotate
 ```
 
+Or from source
+
 ```sh
 git clone https://github.com/EnricoDev1/wl-annotate.git
 cd wl-annotate
