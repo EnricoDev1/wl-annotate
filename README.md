@@ -2,6 +2,8 @@
 
 Draw annotations directly on the screen on Wayland.
 
+![showcase](docs/showcase.gif)
+
 Press a key, the screen freezes, draw with the mouse, press `q` to finish. `wl-annotate` captures a screencopy snapshot of every output and shows it as a fullscreen layer-shell overlay — you draw on the overlay, not in a window.
 
 ## Requirements
