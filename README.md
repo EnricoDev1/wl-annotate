@@ -14,6 +14,12 @@ Press a key, the screen freezes, draw with the mouse, press `q` to finish. `wl-a
 ## Installation
 
 ```sh
+cargo install wl-annotate
+```
+
+```sh
+git clone https://github.com/EnricoDev1/wl-annotate.git
+cd wl-annotate
 cargo install --path .
 ```
 
